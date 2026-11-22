@@ -56,21 +56,8 @@ impl ServicePolicy {
             return false;
         }
 
-        let path = format!("{}/{method}", category.trim_end_matches('/'));
-        let mut provided = BTreeSet::new();
-        for rule in &self.group_rules {
-            let candidate = if rule.category_only { category } else { &path };
-            if matches_pattern(&rule.pattern, candidate) {
-                if rule.has_privacy_policy {
-                    return false;
-                }
-                provided.extend(rule.values.iter().map(String::as_str));
-            }
-        }
-        if self.legacy_private {
-            provided.insert("private");
-        }
-        if !provided.iter().any(|group| peer.groups.contains(*group)) {
+        let (provided, has_privacy_policy) = self.provided_groups(category, method);
+        if has_privacy_policy || !provided.iter().any(|group| peer.groups.contains(*group)) {
             return false;
         }
 
@@ -97,6 +84,23 @@ impl ServicePolicy {
             }
         }
         !needs_trust
+    }
+
+    pub(super) fn provided_groups(&self, category: &str, method: &str) -> (BTreeSet<&str>, bool) {
+        let path = format!("{}/{method}", category.trim_end_matches('/'));
+        let mut provided = BTreeSet::new();
+        let mut has_privacy_policy = false;
+        for rule in &self.group_rules {
+            let candidate = if rule.category_only { category } else { &path };
+            if matches_pattern(&rule.pattern, candidate) {
+                has_privacy_policy |= rule.has_privacy_policy;
+                provided.extend(rule.values.iter().map(String::as_str));
+            }
+        }
+        if self.legacy_private {
+            provided.insert("private");
+        }
+        (provided, has_privacy_policy)
     }
 }
 

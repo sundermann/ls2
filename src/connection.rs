@@ -18,7 +18,7 @@ use async_io::Timer;
 use futures_lite::future;
 
 use crate::address::{self, Address};
-use crate::service::ServicePolicy;
+use crate::service::{INTROSPECTION_METHOD, PRIVATE_CATEGORY, ServicePolicy};
 use crate::stream::{self, Feed, FeedSender};
 use crate::wire::{self, Frame, Kind, Listener, Socket};
 use crate::{
@@ -197,6 +197,14 @@ impl ConnectionBuilder {
                 .transpose()?;
             let name = local.as_ref().map(|service| service.name.as_str());
             if let Some(service) = &local {
+                let frame = wire::append_category(
+                    profile,
+                    tokens.next()?,
+                    PRIVATE_CATEGORY,
+                    [INTROSPECTION_METHOD],
+                )
+                .map_err(encode_error)?;
+                write_setup(&socket, &frame).await?;
                 for (category, methods) in service.router.categories() {
                     let frame = wire::append_category(profile, tokens.next()?, category, methods)
                         .map_err(encode_error)?;

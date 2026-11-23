@@ -18,6 +18,9 @@ type Handler = Box<dyn Fn(Request) -> HandlerFuture + Send + Sync>;
 type Methods = BTreeMap<String, Handler>;
 type Updates = Pin<Box<dyn Stream<Item = Result<String, MethodError>> + Send>>;
 
+pub(crate) const PRIVATE_CATEGORY: &str = "/com/palm/luna/private";
+pub(crate) const INTROSPECTION_METHOD: &str = "introspection";
+
 /// A table of async method handlers to register under a Luna service name.
 #[derive(Default)]
 pub struct Router {
@@ -46,7 +49,7 @@ impl Router {
         Fut: Future<Output = Result<Reply, MethodError>> + Send + 'static,
     {
         let (category, method) = split_path(path)?;
-        if category == "/com/palm/luna/private" {
+        if category == PRIVATE_CATEGORY {
             return Err(Error::invalid(
                 "Luna reserves the /com/palm/luna/private category",
             ));
@@ -77,6 +80,12 @@ impl Router {
         peer: &PeerPolicy,
         public: bool,
     ) -> Result<Reply, DispatchError> {
+        if request.category() == PRIVATE_CATEGORY && request.method() == INTROSPECTION_METHOD {
+            if !policy.permits(peer, PRIVATE_CATEGORY, INTROSPECTION_METHOD, public) {
+                return Err(DispatchError::PermissionDenied);
+            }
+            return Ok(self.introspection(request.payload(), policy));
+        }
         let handler = self
             .routes
             .get(request.category())
@@ -86,6 +95,50 @@ impl Router {
             return Err(DispatchError::PermissionDenied);
         }
         handler(request).await.map_err(DispatchError::Method)
+    }
+
+    fn introspection(&self, payload: &str, policy: &ServicePolicy) -> Reply {
+        let params = json::parse(payload).ok().filter(json::JsonValue::is_object);
+        let description = match params {
+            Some(params)
+                if params.is_empty() || (params.len() == 1 && params["type"] == "flat") =>
+            {
+                false
+            }
+            Some(params) if params.len() == 1 && params["type"] == "description" => true,
+            _ => {
+                return Reply::one(
+                    json::object! {
+                        "returnValue": false,
+                        "errorText": "Expected an object with an optional type of flat or description",
+                    }
+                    .dump(),
+                );
+            }
+        };
+        let mut categories = json::object! {};
+        for (category, methods) in self.categories() {
+            let mut entries = json::object! {};
+            for method in methods {
+                entries[method] = if description {
+                    let (groups, _) = policy.provided_groups(category, method);
+                    json::object! { "provides": groups.into_iter().collect::<Vec<_>>() }
+                } else {
+                    "METHOD".into()
+                };
+            }
+            categories[category] = if description {
+                json::object! { "methods": entries }
+            } else {
+                entries
+            };
+        }
+        let response = if description {
+            json::object! { "returnValue": true, "categories": categories }
+        } else {
+            categories
+        };
+        Reply::one(response.dump())
     }
 }
 
@@ -360,6 +413,66 @@ mod tests {
                 .map(|(category, methods)| (category, methods.collect::<Vec<_>>()))
                 .collect();
             assert_eq!(categories, [("/", vec!["echo"])]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn introspection_lists_routes_for_authorized_peers() -> Result<(), Error> {
+        future::block_on(async {
+            let mut router = Router::new();
+            for path in ["/echo", "/test/nested"] {
+                router.route(path, |_| async { panic!("introspection ran a handler") })?;
+            }
+            let policy = ServicePolicy::from_hub(
+                Some(
+                    r#"[
+                        {"category":"/com/palm/luna/private/*","groups":["inspect"]},
+                        {"category":"/echo","groups":["root"]},
+                        {"category":"/test/","groups":["nested"]}
+                    ]"#,
+                ),
+                None,
+                0,
+            )?;
+            let request = |payload: &str| {
+                Request::new(
+                    PRIVATE_CATEGORY.into(),
+                    INTROSPECTION_METHOD.into(),
+                    payload.into(),
+                    None,
+                )
+            };
+            let allowed = PeerPolicy::from_hub(Some(r#"["inspect"]"#), None, 1)?;
+            let denied = PeerPolicy::from_hub(Some(r#"["root"]"#), None, 1)?;
+            for (payload, expected) in [
+                (
+                    "{}",
+                    r#"{"/":{"echo":"METHOD"},"/test":{"nested":"METHOD"}}"#,
+                ),
+                (
+                    r#"{"type":"description"}"#,
+                    r#"{"returnValue":true,"categories":{
+                        "/":{"methods":{"echo":{"provides":["root"]}}},
+                        "/test":{"methods":{"nested":{"provides":["nested"]}}}
+                    }}"#,
+                ),
+            ] {
+                let reply = router
+                    .dispatch(request(payload), &policy, &allowed, false)
+                    .await
+                    .expect("allowed introspection");
+                let ReplyBody::One(body) = reply.into_body() else {
+                    panic!("introspection returned a stream");
+                };
+                assert_eq!(json::parse(&body).unwrap(), json::parse(expected).unwrap());
+            }
+            assert!(matches!(
+                router
+                    .dispatch(request("{}"), &policy, &denied, false)
+                    .await,
+                Err(DispatchError::PermissionDenied)
+            ));
             Ok(())
         })
     }

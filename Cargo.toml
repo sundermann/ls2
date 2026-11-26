@@ -1,11 +1,12 @@
 [package]
 name = "ls2"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Async Luna Service 2 IPC for webOS TV"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/sundermann/ls2"
 documentation = "https://docs.rs/ls2"
 keywords = ["webos", "luna", "ls2", "ipc"]
 categories = ["asynchronous", "network-programming"]

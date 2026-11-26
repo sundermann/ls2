@@ -18,7 +18,7 @@ use async_io::Timer;
 use futures_lite::future;
 
 use crate::address::{self, Address};
-use crate::service::{INTROSPECTION_METHOD, PRIVATE_CATEGORY, ServicePolicy};
+use crate::service::{INTROSPECTION_METHOD, PING_METHOD, PRIVATE_CATEGORY, ServicePolicy};
 use crate::stream::{self, Feed, FeedSender};
 use crate::wire::{self, Frame, Kind, Listener, Socket};
 use crate::{
@@ -201,7 +201,7 @@ impl ConnectionBuilder {
                     profile,
                     tokens.next()?,
                     PRIVATE_CATEGORY,
-                    [INTROSPECTION_METHOD],
+                    [INTROSPECTION_METHOD, PING_METHOD],
                 )
                 .map_err(encode_error)?;
                 write_setup(&socket, &frame).await?;

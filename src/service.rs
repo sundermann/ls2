@@ -19,6 +19,7 @@ type Methods = BTreeMap<String, Handler>;
 type Updates = Pin<Box<dyn Stream<Item = Result<String, MethodError>> + Send>>;
 
 pub(crate) const PRIVATE_CATEGORY: &str = "/com/palm/luna/private";
+pub(crate) const PING_METHOD: &str = "ping";
 pub(crate) const INTROSPECTION_METHOD: &str = "introspection";
 
 /// A table of async method handlers to register under a Luna service name.
@@ -80,11 +81,16 @@ impl Router {
         peer: &PeerPolicy,
         public: bool,
     ) -> Result<Reply, DispatchError> {
-        if request.category() == PRIVATE_CATEGORY && request.method() == INTROSPECTION_METHOD {
-            if !policy.permits(peer, PRIVATE_CATEGORY, INTROSPECTION_METHOD, public) {
+        if request.category() == PRIVATE_CATEGORY
+            && matches!(request.method(), INTROSPECTION_METHOD | PING_METHOD)
+        {
+            if !policy.permits(peer, PRIVATE_CATEGORY, request.method(), public) {
                 return Err(DispatchError::PermissionDenied);
             }
-            return Ok(self.introspection(request.payload(), policy));
+            return Ok(match request.method() {
+                PING_METHOD => Reply::one(r#"{"returnValue":true}"#),
+                _ => self.introspection(request.payload(), policy),
+            });
         }
         let handler = self
             .routes
@@ -471,6 +477,42 @@ mod tests {
                 router
                     .dispatch(request("{}"), &policy, &denied, false)
                     .await,
+                Err(DispatchError::PermissionDenied)
+            ));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn private_ping_replies_only_to_authorized_peers() -> Result<(), Error> {
+        future::block_on(async {
+            let router = Router::new();
+            let policy = ServicePolicy::from_hub(
+                Some(r#"[{"category":"/com/palm/luna/private/ping","groups":["health"]}]"#),
+                None,
+                0,
+            )?;
+            let allowed = PeerPolicy::from_hub(Some(r#"["health"]"#), None, 1)?;
+            let denied = PeerPolicy::from_hub(Some(r#"["other"]"#), None, 1)?;
+            let request = || {
+                Request::new(
+                    PRIVATE_CATEGORY.into(),
+                    PING_METHOD.into(),
+                    r#"{"extra":true}"#.into(),
+                    None,
+                )
+            };
+
+            let reply = router
+                .dispatch(request(), &policy, &allowed, false)
+                .await
+                .expect("authorized ping");
+            assert!(matches!(
+                reply.into_body(),
+                ReplyBody::One(body) if body == r#"{"returnValue":true}"#
+            ));
+            assert!(matches!(
+                router.dispatch(request(), &policy, &denied, false).await,
                 Err(DispatchError::PermissionDenied)
             ));
             Ok(())

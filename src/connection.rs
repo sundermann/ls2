@@ -102,6 +102,16 @@ impl ConnectionBuilder {
     /// The service name and APIs must be authorized by the hub. Handlers run on the
     /// crate's background executor and may use runtime-neutral futures.
     ///
+    /// ```no_run
+    /// use ls2::Connection;
+    ///
+    /// async fn empty_service() -> Result<Connection, ls2::Error> {
+    ///     Connection::builder()
+    ///         .register("org.example.empty", Default::default())
+    ///         .await
+    /// }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error for an invalid name, connection failure, or rejected registration.

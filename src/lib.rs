@@ -26,5 +26,5 @@ mod wire;
 pub use connection::{Connection, ConnectionBuilder};
 pub use error::{Error, ErrorKind};
 pub use profile::ProtocolProfile;
-pub use service::{MethodError, Reply, Request, Router};
+pub use service::{MethodError, Reply, Request, Router, StatefulRouter};
 pub use stream::{Signal, SignalFilter, SignalStream, Subscription};

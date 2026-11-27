@@ -80,6 +80,8 @@ async fn echo_service() -> Result<Connection, ls2::Error> {
 }
 ```
 
+Use `Router::with_state(state)` to share state across handlers. Add named async functions with `router.route(path, handler)` and have each function take the state followed by the `Request`. Pass the finished router to `register(name, router.into())`. The router clones the state for each call. Pass an `Arc` when handlers need to share mutable state.
+
 Use `Reply::stream` for multiple updates and `MethodError` to send a Luna application error. With `serde`, use `Request::deserialize` and `Reply::json` in service handlers. Handlers run on the crate’s executor. Delegate work that requires a specific runtime to your application’s executor.
 
 The webOS hub must authorize your executable, service name, and operations through its access-control configuration. `ls2` enforces the hub’s caller permissions and denies methods protected by TV privacy controls.

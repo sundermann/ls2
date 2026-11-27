@@ -35,6 +35,39 @@ impl Router {
         Self::default()
     }
 
+    /// Creates an empty router whose handlers receive a clone of `state`.
+    ///
+    /// Use a shared handle such as an `Arc` when handlers need to see changes
+    /// made by other requests.
+    ///
+    /// ```no_run
+    /// use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    /// use ls2::{Connection, MethodError, Reply, Request, Router};
+    ///
+    /// async fn count(state: Arc<AtomicUsize>, _: Request) -> Result<Reply, MethodError> {
+    ///     let count = state.fetch_add(1, Ordering::Relaxed) + 1;
+    ///     Ok(Reply::one(count.to_string()))
+    /// }
+    ///
+    /// async fn counter_service() -> Result<Connection, ls2::Error> {
+    ///     let mut router = Router::with_state(Arc::new(AtomicUsize::new(0)));
+    ///     router.route("/count", count)?;
+    ///     Connection::builder()
+    ///         .register("org.example.counter", router.into())
+    ///         .await
+    /// }
+    /// ```
+    #[must_use]
+    pub fn with_state<S>(state: S) -> StatefulRouter<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        StatefulRouter {
+            router: Self::new(),
+            state,
+        }
+    }
+
     /// Adds a method handler for a path such as `/session/status` or `/echo`.
     ///
     /// The connection polls handlers on its executor. Use futures that can run
@@ -49,22 +82,34 @@ impl Router {
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Reply, MethodError>> + Send + 'static,
     {
+        self.route_with(path, || Box::new(move |request| Box::pin(handler(request))))
+    }
+
+    fn route_with(
+        &mut self,
+        path: &str,
+        make_handler: impl FnOnce() -> Handler,
+    ) -> Result<&mut Self, Error> {
         let (category, method) = split_path(path)?;
         if category == PRIVATE_CATEGORY {
             return Err(Error::invalid(
                 "Luna reserves the /com/palm/luna/private category",
             ));
         }
-        let methods = self.routes.entry(category.to_owned()).or_default();
-        if methods.contains_key(method) {
+        if self
+            .routes
+            .get(category)
+            .is_some_and(|methods| methods.contains_key(method))
+        {
             return Err(Error::invalid(format!(
                 "method path {path:?} is already registered"
             )));
         }
-        methods.insert(
-            method.to_owned(),
-            Box::new(move |request| Box::pin(handler(request))),
-        );
+        let handler = make_handler();
+        self.routes
+            .entry(category.to_owned())
+            .or_default()
+            .insert(method.to_owned(), handler);
         Ok(self)
     }
 
@@ -154,6 +199,55 @@ impl fmt::Debug for Router {
             .debug_struct("Router")
             .field("categories", &self.routes.keys())
             .finish()
+    }
+}
+
+/// A router that gives each handler access to shared service state.
+///
+/// Create it with [`Router::with_state`]. After adding routes, convert it to a
+/// [`Router`] with `.into()` for
+/// [`ConnectionBuilder::register`](crate::ConnectionBuilder::register).
+pub struct StatefulRouter<S> {
+    router: Router,
+    state: S,
+}
+
+impl<S: Clone + Send + Sync + 'static> StatefulRouter<S> {
+    /// Adds a method handler that accepts the state followed by the request.
+    ///
+    /// The router clones the state for each registered handler and each call.
+    /// See [`Router::route`] for details on the handler executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid path, a reserved category, or a path that
+    /// already has a handler.
+    pub fn route<F, Fut>(&mut self, path: &str, handler: F) -> Result<&mut Self, Error>
+    where
+        F: Fn(S, Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Reply, MethodError>> + Send + 'static,
+    {
+        let state = &self.state;
+        self.router.route_with(path, || {
+            let state = state.clone();
+            Box::new(move |request| Box::pin(handler(state.clone(), request)))
+        })?;
+        Ok(self)
+    }
+}
+
+impl<S> fmt::Debug for StatefulRouter<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StatefulRouter")
+            .field("router", &self.router)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> From<StatefulRouter<S>> for Router {
+    fn from(router: StatefulRouter<S>) -> Self {
+        router.router
     }
 }
 
@@ -358,9 +452,82 @@ pub(crate) enum DispatchError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use futures_lite::{StreamExt as _, future, stream};
 
     use super::*;
+
+    #[test]
+    fn rejected_stateful_routes_do_not_clone_state() -> Result<(), Error> {
+        struct CloneCount(Arc<AtomicUsize>);
+
+        impl Clone for CloneCount {
+            fn clone(&self) -> Self {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Self(Arc::clone(&self.0))
+            }
+        }
+
+        let clones = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::with_state(CloneCount(Arc::clone(&clones)));
+        let handler = |_: CloneCount, _: Request| async { Ok(Reply::one("{}")) };
+        router.route("/test/count", handler)?;
+        assert_eq!(clones.load(Ordering::Relaxed), 1);
+
+        for path in ["/", "/com/palm/luna/private/reserved", "/test/count"] {
+            let error = router.route(path, handler).unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+            assert_eq!(clones.load(Ordering::Relaxed), 1, "rejected path {path}");
+        }
+        assert!(format!("{router:?}").contains("/test"));
+        Ok(())
+    }
+
+    #[test]
+    fn named_handlers_share_state_across_routes_and_requests() -> Result<(), Error> {
+        async fn increment(state: Arc<AtomicUsize>, request: Request) -> HandlerResult {
+            state.fetch_add(1, Ordering::Relaxed);
+            Ok(Reply::one(request.into_payload()))
+        }
+
+        async fn count(state: Arc<AtomicUsize>, _: Request) -> HandlerResult {
+            Ok(Reply::one(state.load(Ordering::Relaxed).to_string()))
+        }
+
+        future::block_on(async {
+            let mut router = Router::with_state(Arc::new(AtomicUsize::new(0)));
+            router
+                .route("/test/increment", increment)?
+                .route("/test/count", count)?;
+            assert!(router.route("/test/count", count).is_err());
+            let router = Router::from(router);
+            let policy = ServicePolicy::from_hub(
+                Some(r#"[{"category":"/test/","groups":["counter"]}]"#),
+                None,
+                0,
+            )?;
+            let peer = PeerPolicy::from_hub(Some(r#"["counter"]"#), None, 1)?;
+
+            for (method, expected) in [
+                ("count", "0"),
+                ("increment", "payload"),
+                ("increment", "payload"),
+                ("count", "2"),
+            ] {
+                let request = Request::new("/test".into(), method.into(), "payload".into(), None);
+                let reply = router
+                    .dispatch(request, &policy, &peer, false)
+                    .await
+                    .expect("authorized handler");
+                assert!(matches!(reply.into_body(), ReplyBody::One(body) if body == expected));
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn only_authorized_requests_reach_the_handler() -> Result<(), Error> {

@@ -82,22 +82,34 @@ impl Router {
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Reply, MethodError>> + Send + 'static,
     {
+        self.route_with(path, || Box::new(move |request| Box::pin(handler(request))))
+    }
+
+    fn route_with(
+        &mut self,
+        path: &str,
+        make_handler: impl FnOnce() -> Handler,
+    ) -> Result<&mut Self, Error> {
         let (category, method) = split_path(path)?;
         if category == PRIVATE_CATEGORY {
             return Err(Error::invalid(
                 "Luna reserves the /com/palm/luna/private category",
             ));
         }
-        let methods = self.routes.entry(category.to_owned()).or_default();
-        if methods.contains_key(method) {
+        if self
+            .routes
+            .get(category)
+            .is_some_and(|methods| methods.contains_key(method))
+        {
             return Err(Error::invalid(format!(
                 "method path {path:?} is already registered"
             )));
         }
-        methods.insert(
-            method.to_owned(),
-            Box::new(move |request| Box::pin(handler(request))),
-        );
+        let handler = make_handler();
+        self.routes
+            .entry(category.to_owned())
+            .or_default()
+            .insert(method.to_owned(), handler);
         Ok(self)
     }
 
@@ -215,10 +227,21 @@ impl<S: Clone + Send + Sync + 'static> StatefulRouter<S> {
         F: Fn(S, Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Reply, MethodError>> + Send + 'static,
     {
-        let state = self.state.clone();
-        self.router
-            .route(path, move |request| handler(state.clone(), request))?;
+        let state = &self.state;
+        self.router.route_with(path, || {
+            let state = state.clone();
+            Box::new(move |request| Box::pin(handler(state.clone(), request)))
+        })?;
         Ok(self)
+    }
+}
+
+impl<S> fmt::Debug for StatefulRouter<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StatefulRouter")
+            .field("router", &self.router)
+            .finish_non_exhaustive()
     }
 }
 
@@ -437,6 +460,32 @@ mod tests {
     use futures_lite::{StreamExt as _, future, stream};
 
     use super::*;
+
+    #[test]
+    fn rejected_stateful_routes_do_not_clone_state() -> Result<(), Error> {
+        struct CloneCount(Arc<AtomicUsize>);
+
+        impl Clone for CloneCount {
+            fn clone(&self) -> Self {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Self(Arc::clone(&self.0))
+            }
+        }
+
+        let clones = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::with_state(CloneCount(Arc::clone(&clones)));
+        let handler = |_: CloneCount, _: Request| async { Ok(Reply::one("{}")) };
+        router.route("/test/count", handler)?;
+        assert_eq!(clones.load(Ordering::Relaxed), 1);
+
+        for path in ["/", "/com/palm/luna/private/reserved", "/test/count"] {
+            let error = router.route(path, handler).unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+            assert_eq!(clones.load(Ordering::Relaxed), 1, "rejected path {path}");
+        }
+        assert!(format!("{router:?}").contains("/test"));
+        Ok(())
+    }
 
     #[test]
     fn named_handlers_share_state_across_routes_and_requests() -> Result<(), Error> {
